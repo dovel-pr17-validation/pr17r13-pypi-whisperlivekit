@@ -1,0 +1,141 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint and lockfile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pip install "ruff==0.16.*"
+
+      - name: Run ruff check
+        run: ruff check .
+
+      - name: Verify uv lockfile
+        run: |
+          pip install "uv==0.10.*"
+          uv lock --check
+
+  package:
+    name: Build package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Build and inspect distributions
+        run: |
+          pip install build twine
+          python -m build
+          twine check dist/*
+
+  import-check:
+    name: Import on Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package
+        run: pip install -e .
+
+      - name: Verify imports
+        run: python -c "from whisperlivekit import TranscriptionEngine, AudioProcessor, TestHarness, TestState, transcribe_audio; print('All imports OK')"
+
+  diart-import:
+    name: Diart dependency compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Verify Diart imports with matching Torch versions
+        run: |
+          pip install "uv==0.10.*"
+          uv run --isolated --locked --no-dev --extra diarization-diart python - <<'PY'
+          import diart
+          import torch
+          import torchaudio
+          import torchvision
+
+          torch_version = torch.__version__.split("+", 1)[0]
+          torchaudio_version = torchaudio.__version__.split("+", 1)[0]
+          assert torch_version.split(".")[:2] == torchaudio_version.split(".")[:2], (
+              f"Torch {torch_version} and Torchaudio {torchaudio_version} must share major.minor"
+          )
+          print(
+              f"Diart imports OK with Torch {torch_version}, "
+              f"Torchaudio {torchaudio_version}, and Torchvision {torchvision.__version__}"
+          )
+          PY
+
+  test:
+    # Required status-check name in the main branch ruleset.
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package with test deps
+        run: pip install -e ".[test]" qwen3-asr-causal
+
+      - name: Install FFmpeg for audio integration tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Run regression suite
+        run: pytest -q tests/ --ignore=tests/test_pipeline.py --ignore=tests/test_asr_coalescing_pipeline.py
+
+      # Keep real-audio coverage visible: this step downloads Whisper tiny
+      # and LibriSpeech audio and feeds it at real-time speed.
+      - name: Verify Whisper streaming boundaries with real audio
+        run: pytest -q tests/test_asr_coalescing_pipeline.py
